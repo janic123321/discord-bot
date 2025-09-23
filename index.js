@@ -28,7 +28,38 @@ client.once('clientReady', () => {
 client.login(REMOVED);
 
 // === Webhook Server für Gumroad ===
-app.use(bodyParser.json());
+app.use(bodyParser.json());// === Webhook Route ===
+app.post('/gumroad-webhook', async (req, res) => {
+    const data = req.body;
+    console.log('Webhook von Gumroad empfangen:', data);
+
+    const guild = client.guilds.cache.first(); // Nimmt den ersten Server
+    const member = await guild.members.fetch(data.discord_id).catch(() => null);
+
+    if (!member) {
+        console.log(`Kein Mitglied mit Discord-ID ${data.discord_id} gefunden.`);
+        return res.status(404).send('Member nicht gefunden');
+    }
+
+    // Preis-basiertes Rollen-System (Beispiel)
+    if (data.price < 4000) { // alles unter 4000 Cent = günstige Rolle
+        await member.roles.add(ROLE_CHEAP_ID);
+        console.log(`Günstige Rolle an ${member.user.tag} vergeben`);
+    } else if (data.price >= 4000) { // alles ab 4000 Cent = teure Rolle
+        await member.roles.add(ROLE_EXPENSIVE_ID);
+        console.log(`Teure Rolle an ${member.user.tag} vergeben`);
+    }
+
+    res.status(200).send('OK');
+});
+
+// Server starten
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Webhook-Server läuft auf Port ${PORT}`);
+});
+
+
 
 app.post('/gumroad-webhook', async (req, res) => {
     const data = req.body;
@@ -72,5 +103,16 @@ app.post('/webhook', (req, res) => {
   console.log('Webhook received:', req.body);
   res.sendStatus(200);
 });
+
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Webhook-Server läuft auf Port ${PORT}`);
+});
+
+
+
+cd ~/discord-bot
+
 
 
