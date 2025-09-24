@@ -1,118 +1,180 @@
-// index.js
+// index.js - sauber, emoji-frei, Render-kompatibel
+
 const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
 const bodyParser = require('body-parser');
+const fs = require('fs');
 
-const app = express();
-const PORT = 3000; // Port für den Webhook-Server
+// === Konfiguration (aus Environment-Variablen) ===
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const ROLE_CHEAP_ID = process.env.ROLE_CHEAP_ID;
+const ROLE_EXPENSIVE_ID = process.env.ROLE_EXPENSIVE_ID;
+const DISCORD_INVITE_LINK = process.env.DISCORD_INVITE_LINK;
+const PURCHASES_FILE = './purchases.json';
 
-// === Discord Bot Setup ===
+// einfache Prüfungen beim Start
+if (!DISCORD_TOKEN) console.error('ERROR: DISCORD_TOKEN fehlt');
+if (!ROLE_CHEAP_ID) console.error('ERROR: ROLE_CHEAP_ID fehlt');
+if (!ROLE_EXPENSIVE_ID) console.error('ERROR: ROLE_EXPENSIVE_ID fehlt');
+if (!DISCORD_INVITE_LINK) console.error('ERROR: DISCORD_INVITE_LINK fehlt');
+
+// Hilfsfunktionen: purchases.json laden/speichern
+function loadPurchases() {
+  try {
+    if (!fs.existsSync(PURCHASES_FILE)) return {};
+    const raw = fs.readFileSync(PURCHASES_FILE, 'utf8');
+    return JSON.parse(raw || '{}');
+  } catch (e) {
+    console.error('Fehler beim Laden der purchases.json:', e);
+    return {};
+  }
+}
+function savePurchases(purchases) {
+  try {
+    fs.writeFileSync(PURCHASES_FILE, JSON.stringify(purchases, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Fehler beim Schreiben der purchases.json:', e);
+  }
+}
+
+// Discord-Client
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers
-    ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
 });
 
-// === Konfiguration ===
-const REMOVED = process.env.REMOVED;
-const VERIFY_CHANNEL_ID = '1417121308839379107'; // Verify Channel ID
-const ROLE_CHEAP_ID = '1399394163254100009';     // Günstige Rolle
-const ROLE_EXPENSIVE_ID = '1399394413083627663'; // Teure Rolle
-
-// === Bot-Login ===
-client.once('clientReady', () => {
-    console.log(`Bot ist online als ${client.user.tag}`);
+// Event: Bot ready
+client.once('ready', () => {
+  console.log(`Bot ist online als ${client.user.tag}`);
 });
 
-client.login(REMOVED);
+// Express-App + Webhook
+const app = express();
+app.use(bodyParser.json());
 
-// === Webhook Server für Gumroad ===
-app.use(bodyParser.json());// === Webhook Route ===
+/*
+Expected webhook payloads (flexibel):
+- data.discord_id (Discord user ID) OR
+- data.discord_username (just username) OR
+- data.discord_tag (username#1234)
+- data.price  (price in cents or number)
+*/
 app.post('/gumroad-webhook', async (req, res) => {
-    const data = req.body;
-    console.log('Webhook von Gumroad empfangen:', data);
+  const data = req.body || {};
+  console.log('Webhook empfangen:', data);
 
-    const guild = client.guilds.cache.first(); // Nimmt den ersten Server
-    const member = await guild.members.fetch(data.discord_id).catch(() => null);
+  // einfache Validierung
+  if (!data || (!data.discord_id && !data.discord_username && !data.discord_tag)) {
+    return res.status(400).json({ error: 'discord_id oder discord_username oder discord_tag required' });
+  }
 
-    if (!member) {
-        console.log(`Kein Mitglied mit Discord-ID ${data.discord_id} gefunden.`);
-        return res.status(404).send('Member nicht gefunden');
+  // Preis auswerten (robust gegen Strings)
+  let price = 0;
+  if (data.price !== undefined && data.price !== null) {
+    price = Number(data.price);
+    if (Number.isNaN(price)) price = 0;
+  }
+
+  // Bestimme gewünschte Rolle anhand Preis (anpassbar)
+  // Hier: >= 5000 (cents) = expensive, sonst cheap
+  const roleId = price >= 5000 ? ROLE_EXPENSIVE_ID : ROLE_CHEAP_ID;
+
+  // Versuche, den Guild-Context zu bekommen
+  const guild = client.guilds.cache.first();
+  if (!guild) {
+    console.error('Kein verfügbarer Guild-Cache. Bot ist in keinem Server oder Guilds noch nicht geladen.');
+    // Speichern, damit wir es bei guildMemberAdd nachreichen können
+    const purchases = loadPurchases();
+    const key = data.discord_id || (data.discord_username || data.discord_tag).toString().toLowerCase();
+    purchases[key] = { roleId, price, timestamp: Date.now() };
+    savePurchases(purchases);
+    return res.json({ message: 'Bot noch nicht bereit, Kauf gespeichert; Invite:' , invite: DISCORD_INVITE_LINK });
+  }
+
+  let member = null;
+
+  // 1) Direkt nach ID suchen (best)
+  if (data.discord_id) {
+    try {
+      member = await guild.members.fetch(data.discord_id).catch(() => null);
+    } catch (e) {
+      member = null;
     }
+  }
 
-    // Preis-basiertes Rollen-System (Beispiel)
-    if (data.price < 4000) { // alles unter 4000 Cent = günstige Rolle
-        await member.roles.add(ROLE_CHEAP_ID);
-        console.log(`Günstige Rolle an ${member.user.tag} vergeben`);
-    } else if (data.price >= 4000) { // alles ab 4000 Cent = teure Rolle
-        await member.roles.add(ROLE_EXPENSIVE_ID);
-        console.log(`Teure Rolle an ${member.user.tag} vergeben`);
+  // 2) Wenn keine ID: alle Mitglieder fetchen (Achtung: große Server -> benötigt Intent & kann teuer sein)
+  if (!member && (data.discord_username || data.discord_tag)) {
+    try {
+      const all = await guild.members.fetch(); // benötigt GUILD_MEMBERS intent
+      const search = (data.discord_tag || data.discord_username).toString().toLowerCase();
+      member = all.find(m => {
+        const u = m.user;
+        if (!u) return false;
+        // match username or full tag (username#1234)
+        if (u.username && u.username.toLowerCase() === search) return true;
+        if (u.tag && u.tag.toLowerCase() === search) return true;
+        return false;
+      }) || null;
+    } catch (e) {
+      console.error('Fehler beim Laden aller Mitglieder:', e);
+      member = null;
     }
+  }
 
-    res.status(200).send('OK');
-});
-
-// Server starten
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Webhook-Server läuft auf Port ${PORT}`);
-});
-
-
-
-app.post('/gumroad-webhook', async (req, res) => {
-    const data = req.body;
-    console.log('Webhook empfangen:', data);
-
-    const guild = client.guilds.cache.first(); // Nimmt den ersten Server
-    const member = await guild.members.fetch(data.discord_id).catch(() => null);
-
-    if (!member) {
-        console.log(`Kein Mitglied mit Discord-ID ${data.discord_id} gefunden. Verify nötig.`);
-        return res.status(404).send('Member nicht gefunden');
+  if (member) {
+    // Member vorhanden -> Rolle zuweisen
+    try {
+      await member.roles.add(roleId);
+      console.log(`Rolle ${roleId} an ${member.user.tag} vergeben`);
+      return res.json({ message: 'Rolle vergeben' });
+    } catch (err) {
+      console.error('Fehler beim Rollen vergeben:', err);
+      return res.status(500).json({ error: 'Rollen-Vergabe fehlgeschlagen' });
     }
+  } else {
+    // Member nicht gefunden -> Kauf speichern & Invite zurückgeben
+    const purchases = loadPurchases();
+    const key = data.discord_id || (data.discord_username || data.discord_tag).toString().toLowerCase();
+    purchases[key] = { roleId, price, timestamp: Date.now() };
+    savePurchases(purchases);
+    console.log(`Kauf gespeichert für ${key}. Invite zurückgegeben.`);
+    return res.json({ message: 'Invite gesendet', invite: DISCORD_INVITE_LINK });
+  }
+});
 
-    // Preis prüfen und Rolle vergeben
-    if (data.price < 4000) { // alles unter 4000 Cent = günstige Rolle
-        await member.roles.add(ROLE_CHEAP_ID);
-        console.log(`Günstige Rolle (${ROLE_CHEAP_ID}) an ${member.user.tag} vergeben`);
-    } else if (data.price > 4500) { // alles über 4500 Cent = teure Rolle
-        await member.roles.add(ROLE_EXPENSIVE_ID);
-        console.log(`Teure Rolle (${ROLE_EXPENSIVE_ID}) an ${member.user.tag} vergeben`);
-    } else {
-        console.log(`Preis ${data.price} liegt zwischen 4000 und 4500 Cent – keine Rolle vergeben`);
+// Wenn ein neuer Member dem Server beitritt, prüfen wir ob wir einen Eintrag haben
+client.on('guildMemberAdd', async (member) => {
+  try {
+    const purchases = loadPurchases();
+    // match nach ID zuerst, dann username/tag
+    const keyById = member.id;
+    const keyByUsername = member.user.username ? member.user.username.toLowerCase() : null;
+    const keyByTag = member.user.tag ? member.user.tag.toLowerCase() : null;
+
+    let entry = purchases[keyById] || (keyByUsername && purchases[keyByUsername]) || (keyByTag && purchases[keyByTag]);
+
+    if (entry && entry.roleId) {
+      try {
+        await member.roles.add(entry.roleId);
+        console.log(`Stored role ${entry.roleId} assigned to ${member.user.tag}`);
+        // Eintrag entfernen, damit er nicht erneut verwendet wird
+        delete purchases[keyById];
+        if (keyByUsername) delete purchases[keyByUsername];
+        if (keyByTag) delete purchases[keyByTag];
+        savePurchases(purchases);
+      } catch (err) {
+        console.error('Fehler beim Zuweisen gespeicherter Rolle:', err);
+      }
     }
-
-    res.status(200).send('OK');
+  } catch (e) {
+    console.error('Fehler im guildMemberAdd Handler:', e);
+  }
 });
 
-// Server starten
-app.listen(PORT, () => {
-    console.log(`Webhook-Server läuft auf Port ${PORT}`);
+// Server starten (kein const PORT definieren)
+app.listen(process.env.PORT, () => {
+  console.log('Webhook-Server läuft auf Port', process.env.PORT);
 });
 
-     // === Webhook Route ===
-app.post('/webhook', (req, res) => {
-    console.log('Webhook received:', req.body);
-    res.sendStatus(200);
-});
-
-
-app.post('/webhook', (req, res) => {
-  console.log('Webhook received:', req.body);
-  res.sendStatus(200);
-});
-
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Webhook-Server läuft auf Port ${PORT}`);
-});
-
-
-
-cd ~/discord-bot
-
-
+// Discord einloggen (als letzter Schritt)
+client.login(DISCORD_TOKEN);
 
